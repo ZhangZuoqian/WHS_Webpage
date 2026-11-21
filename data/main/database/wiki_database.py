@@ -422,6 +422,30 @@ ERROR_MESSAGES: dict[str, dict[str, str]] = {
         "zh": "文件不存在",
         "en": "File not found",
     },
+    "wiki_import_unsupported": {
+        "zh": "不支持的文件类型（仅支持 .docx / .xlsx）",
+        "en": "Unsupported file type (.docx / .xlsx only)",
+    },
+    "wiki_import_too_large": {
+        "zh": "文件过大（上限 10MB）",
+        "en": "File too large (10MB limit)",
+    },
+    "wiki_import_unavailable": {
+        "zh": "服务器未安装文档转换组件，请联系管理员",
+        "en": "Document converter is not installed on the server, please contact the admin",
+    },
+    "wiki_import_too_many_cells": {
+        "zh": "表格内容过多（超过 2 万个单元格），请拆分后再导入",
+        "en": "Too many table cells (over 20,000), please split the file before importing",
+    },
+    "wiki_import_failed": {
+        "zh": "文档解析失败，请确认文件未损坏",
+        "en": "Failed to parse the document, please make sure the file is not corrupted",
+    },
+    "wiki_import_empty": {
+        "zh": "文档中没有可导入的文字或表格",
+        "en": "The document contains no importable text or tables",
+    },
     "wiki_redirect_invalid": {
         "zh": "重定向不合法：来源不能是现有页面，且不能指向自身或形成循环",
         "en": "Invalid redirect: source must not be an existing page, and cannot point to itself or form a loop",

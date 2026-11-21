@@ -32,26 +32,56 @@ _SETTINGS_CACHE: dict[str, tuple[float, dict | None]] = {}
 _PROBE_CACHE: dict[str, tuple[float, bool]] = {}
 
 
+def _servers() -> list[dict]:
+    """把 map 配置解析成服务器列表。
+
+    新格式用 servers 数组，一台机器多个实例或多台机器都能表达；
+    旧的扁平字段（bluemap_base / bluemap_viewer / maps）视为单服，保持兼容。
+    """
+    cfg = read_config().get("map", {}) or {}
+    raw = cfg.get("servers")
+    if not isinstance(raw, list) or not raw:
+        raw = [cfg]
+    out = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        maps = item.get("maps") or ["world"]
+        if isinstance(maps, str):
+            maps = [maps]
+        maps = [str(m) for m in maps]
+        sid = str(item.get("id") or ("main" if len(raw) == 1 else f"server{i + 1}"))
+        out.append({
+            "id": sid,
+            "name": str(item.get("name") or sid),
+            # 后端拉 settings / 玩家数据用，只走内网
+            "base": str(item.get("bluemap_base") or "http://127.0.0.1:8100").rstrip("/"),
+            # 浏览器入口，必须同源；补尾斜杠避免落到前端路由
+            "viewer": str(item.get("bluemap_viewer") or "/map3d/").rstrip("/") + "/",
+            "maps": maps,
+            "default": str(item.get("default") or maps[0]),
+            "start_y": float(item.get("start_y") or 80),
+            # 每台服可以单独覆盖超时，跨机器的实例通常要放宽
+            "timeout": float(item.get("timeout") or cfg.get("timeout") or 10),
+        })
+    return out
+
+
 def _map_cfg() -> dict:
     cfg = read_config().get("map", {}) or {}
-    maps = cfg.get("maps") or ["world"]
-    if isinstance(maps, str):
-        maps = [maps]
-    maps = [str(m) for m in maps]
     return {
-        # 后端拉取 settings.json / 玩家数据用的上游地址，只在内网访问
-        "base": str(cfg.get("bluemap_base") or "http://127.0.0.1:8100").rstrip("/"),
-        # 浏览器访问的入口，必须是同源路径，由 nginx 反代到上面的 base
-        # 统一补尾斜杠：nginx 的 location /map3d/ 带斜杠，少一个斜杠会落到前端路由
-        "viewer": str(cfg.get("bluemap_viewer") or "/map3d/").rstrip("/") + "/",
-        "maps": maps,
-        "default": str(cfg.get("default") or maps[0]),
-        "timeout": float(cfg.get("timeout") or 10),
+        "servers": _servers(),
         "cookie": str(cfg.get("cookie_name") or "whs_map"),
         "ttl": int(cfg.get("viewer_ttl") or 600),
         "cookie_secure": bool(cfg.get("cookie_secure", False)),
-        "start_y": float(cfg.get("start_y") or 80),
     }
+
+
+def _pick_server(cfg: dict, sid: str) -> dict | None:
+    """按 id 取服务器；不传时取第一个。"""
+    if not sid:
+        return cfg["servers"][0] if cfg["servers"] else None
+    return next((s for s in cfg["servers"] if s["id"] == sid), None)
 
 
 def _b64(raw: bytes) -> str:
@@ -138,13 +168,37 @@ def _map_meta(cfg: dict, mid: str) -> dict | None:
 
 @router.get("/api/map/config")
 def map_config(response: Response, authorization: str = Header(None)):
-    """下发入口配置，并写入短期 HttpOnly Cookie。"""
+    """下发全部服务器的入口配置，并写入短期 HttpOnly Cookie。"""
     user, err = _member(authorization)
     if err:
         return err
 
     cfg = _map_cfg()
-    if not _viewer_alive(cfg):
+    if not cfg["servers"]:
+        return _error_response("map_not_ready", 503)
+
+    servers = []
+    for s in cfg["servers"]:
+        items = []
+        for mid in s["maps"]:
+            meta = _map_meta(s, mid) or {}
+            items.append({
+                "id": mid,
+                "name": meta.get("name") or mid,
+                "start": meta.get("start") or [0, 0],
+            })
+        servers.append({
+            "id": s["id"],
+            "name": s["name"],
+            "viewer": s["viewer"],
+            "maps": items,
+            "default": s["default"],
+            "start_y": s["start_y"],
+            # 单个服没部署不影响其他服，前端据此决定能不能切过去
+            "ready": _viewer_alive(s),
+        })
+
+    if not any(s["ready"] for s in servers):
         return _error_response("map_not_ready", 503)
 
     exp = int(time.time()) + cfg["ttl"]
@@ -158,21 +212,7 @@ def map_config(response: Response, authorization: str = Header(None)):
         secure=cfg["cookie_secure"],
     )
 
-    items = []
-    for mid in cfg["maps"]:
-        meta = _map_meta(cfg, mid) or {}
-        items.append({
-            "id": mid,
-            "name": meta.get("name") or mid,
-            "start": meta.get("start") or [0, 0],
-        })
-    return {
-        "viewer": cfg["viewer"],
-        "maps": items,
-        "default": cfg["default"],
-        "start_y": cfg["start_y"],
-        "ttl": cfg["ttl"],
-    }
+    return {"servers": servers, "ttl": cfg["ttl"]}
 
 
 @router.get("/api/map/auth")
@@ -185,18 +225,22 @@ def map_auth(request: Request):
 
 
 @router.get("/api/map/players")
-def map_players(map_id: str = "", authorization: str = Header(None)):
-    """当前世界的在线玩家数量（页头展示用）。"""
+def map_players(server: str = "", map_id: str = "", authorization: str = Header(None)):
+    """指定服务器的在线玩家数量（页头展示用）。"""
     _, err = _member(authorization)
     if err:
         return err
 
     cfg = _map_cfg()
-    mid = map_id or cfg["default"]
-    if mid not in cfg["maps"]:
+    s = _pick_server(cfg, server)
+    if s is None:
         return _error_response("map_not_found", 404)
 
-    body = _fetch(f"{cfg['base']}/maps/{mid}/live/players.json", cfg["timeout"])
+    mid = map_id or s["default"]
+    if mid not in s["maps"]:
+        return _error_response("map_not_found", 404)
+
+    body = _fetch(f"{s['base']}/maps/{mid}/live/players.json", s["timeout"])
     if body is None:
         return _error_response("map_upstream_error", 502)
     try:

@@ -10,14 +10,14 @@ const { state: authState } = useAuth()
 
 const wrapEl = ref(null)
 const frameEl = ref(null)
-const maps = ref([])
+// 一个网站可以挂多台服务器：主服、创造服，同机多实例或不同机器都走同一个列表
+const servers = ref([])
+const activeServerId = ref(localStorage.getItem('whs_map_server') || '')
 const activeMap = ref('')
 const playerCount = ref(0)
 // 2D / 3D 只是同一个 BlueMap 网页端的两种视图，记住上次选择
 const viewMode = ref(localStorage.getItem('whs_map_view') === '3d' ? '3d' : '2d')
-const viewer = ref('')
 const startPos = ref([0, 0])
-const startY = ref(80)
 const available = ref(false)
 const loaded = ref(false)
 const failed = ref(false)
@@ -28,25 +28,44 @@ const loading = ref(true)
 // 换图或换视图时递增，强制重建 iframe，让 BlueMap 按新参数初始化
 const frameKey = ref(0)
 
+const activeServer = computed(() => {
+  const list = servers.value
+  return list.find((s) => s.id === activeServerId.value)
+    || list.find((s) => s.ready)
+    || list[0]
+    || null
+})
+const maps = computed(() => activeServer.value?.maps || [])
+const viewer = computed(() => activeServer.value?.viewer || '')
+const startY = computed(() => Number(activeServer.value?.start_y) || 80)
+// 多服时才显示切换器，单服保持原来的简洁布局
+const multiServer = computed(() => servers.value.length > 1)
+
 let configTimer = null
 let playersTimer = null
 let loadTimer = null
 let controlsTimer = null
+let tuneTimer = null
+let sizeTimer = null
 
 // BlueMap 5.x 的 hash 共 10 段：
 // mapId:x:y:z:distance:rotation:angle:tilt:ortho:view
 // ortho 是数字（1=正交），view 必须是 flat / perspective 字符串。
-// 之前把布尔值放在第 9 段、view 放在第 9 段，都会让 BlueMap 回退成透视视角。
+// 之前把 flat/perspective 写在第 9 段、把数字写在第 10 段，字段正好错位，
+// BlueMap 解析失败后会回退成透视视角。
 const viewerSrc = computed(() => {
   if (!viewer.value || !activeMap.value) return ''
   const flat = viewMode.value === '2d'
   const [x, z] = startPos.value
-  const distance = flat ? 1000 : 150
+  // 3D 用带俯角的中距离机位。贴地平视正对 BlueMap 的地形拉伸断面，
+  // 远处会像一片尖塔和纸片，这是它用高度图挤地形的固有表现。
+  // angle 是俯仰，tilt 是横滚，必须保持 0，否则画面会整体歪斜。
+  const distance = flat ? 1000 : 420
   const angle = flat ? 0 : 1.1
   const tilt = 0
   const ortho = flat ? 1 : 0
   const view = flat ? 'flat' : 'perspective'
-  const y = startY.value + (flat ? 0 : 20)
+  const y = startY.value + (flat ? 0 : 30)
   return `${viewer.value}#${activeMap.value}:${x}:${y}:${z}:${distance}:0:${angle}:${tilt}:${ortho}:${view}`
 })
 
@@ -75,12 +94,14 @@ async function enterImmersive() {
     try {
       await el.requestFullscreen()
       immersive.value = true
+      syncFrameSize()
       return
     } catch {
       // 没有用户手势等情况下退化为铺满视口
     }
   }
   immersive.value = true
+  syncFrameSize()
 }
 
 async function exitImmersive() {
@@ -92,10 +113,12 @@ async function exitImmersive() {
     }
   }
   immersive.value = false
+  syncFrameSize()
 }
 
 function onFullscreenChange() {
   immersive.value = !!document.fullscreenElement
+  syncFrameSize()
 }
 
 function onKeydown(e) {
@@ -133,9 +156,72 @@ function onFrameLoad() {
   loaded.value = true
   failed.value = false
   if (loadTimer) clearTimeout(loadTimer)
+  tuneFrame()
   showControls.value = true
   if (controlsTimer) clearTimeout(controlsTimer)
   controlsTimer = setTimeout(() => { showControls.value = false }, 6000)
+}
+
+// ---------- 内嵌界面适配 ----------
+// BlueMap 网页端的 UI 是按整页浏览调的，塞进站内 iframe 后字和控件都会偏大。
+// 同源 iframe 可以直接改它的根字号，整体等比压到接近官网的比例。
+// 地图画布不受 font-size 影响，所以不会伤到渲染清晰度。
+const EMBED_TUNE_CSS = `
+  /* 手机上的双指缩放会和浏览器页面缩放打架，表现为画面被斜着拉成一条。
+     把触摸手势全部交给地图自己处理，浏览器不再插手。 */
+  html, body {
+    touch-action: none !important;
+    overscroll-behavior: none !important;
+    font-size: 12px !important;
+  }
+  canvas, .scene-canvas, #scene-canvas {
+    touch-action: none !important;
+  }
+  /* 原生控件的圆角、描边向站点靠拢，压掉那层灰底方块感 */
+  .hud button, .hud input, .hud select,
+  .hud .button, .hud .control {
+    border-radius: 10px !important;
+    border: 1px solid rgba(255, 255, 255, .10) !important;
+    background: rgba(20, 21, 24, .72) !important;
+    backdrop-filter: blur(12px);
+  }
+  .hud-top, .hud .hud-top {
+    background: rgba(20, 21, 24, .72) !important;
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid rgba(255, 255, 255, .08);
+  }
+`
+
+function tuneFrame() {
+  const doc = frameEl.value?.contentDocument
+  if (!doc) return
+  try {
+    if (doc.getElementById('whs-embed-tune')) return
+    const style = doc.createElement('style')
+    style.id = 'whs-embed-tune'
+    style.textContent = EMBED_TUNE_CSS
+    ;(doc.head || doc.documentElement).appendChild(style)
+  } catch {
+    // 跨域或文档未就绪时放弃，不影响主流程
+  }
+  // BlueMap 是单页应用，视图切换后可能重建界面节点，补一次保险
+  if (tuneTimer) clearTimeout(tuneTimer)
+  tuneTimer = setTimeout(tuneFrame, 1200)
+}
+
+// 进出全屏、手机横竖屏切换后 iframe 内部的尺寸不会自己重算，
+// 画面会被压成一条。这里主动通知它重新布局。
+function syncFrameSize() {
+  if (sizeTimer) clearTimeout(sizeTimer)
+  sizeTimer = setTimeout(() => {
+    try {
+      const win = frameEl.value?.contentWindow
+      win?.dispatchEvent(new Event('resize'))
+    } catch {
+      // 跨域时忽略
+    }
+    tuneFrame()
+  }, 240)
 }
 
 // ---------- 配置与玩家数 ----------
@@ -171,9 +257,13 @@ async function refreshCookie() {
 }
 
 async function loadPlayers() {
-  if (!activeMap.value || gate.value) return
+  if (!activeMap.value || gate.value || !activeServer.value) return
+  const query = new URLSearchParams({
+    server: activeServer.value.id,
+    map_id: activeMap.value,
+  })
   try {
-    const res = await fetch(`/api/map/players?map_id=${encodeURIComponent(activeMap.value)}`, {
+    const res = await fetch(`/api/map/players?${query}`, {
       headers: authHeaders(),
     })
     if (!res.ok) return
@@ -182,6 +272,28 @@ async function loadPlayers() {
   } catch {
     // 轮询失败不打扰用户
   }
+}
+
+function applyServer(keepMap) {
+  const srv = activeServer.value
+  if (!srv) {
+    showGate('error')
+    return
+  }
+  const list = srv.maps || []
+  const target = (keepMap && list.find((m) => m.id === activeMap.value))
+    || list.find((m) => m.id === srv.default)
+    || list[0]
+  if (!target) {
+    showGate('error')
+    return
+  }
+  activeMap.value = target.id
+  startPos.value = target.start || [0, 0]
+  loaded.value = false
+  failed.value = false
+  frameKey.value += 1
+  beginLoad()
 }
 
 async function loadConfig() {
@@ -194,23 +306,16 @@ async function loadConfig() {
     }
     gate.value = null
     available.value = true
-    viewer.value = data.viewer || ''
-    startY.value = Number(data.start_y) || 80
-    maps.value = data.maps || []
-
-    const target = data.maps?.find((m) => m.id === activeMap.value)
-      || data.maps?.find((m) => m.id === data.default)
-      || data.maps?.[0]
-    if (!target) {
+    servers.value = data.servers || []
+    if (!activeServer.value) {
       showGate('error')
       return
     }
-    activeMap.value = target.id
-    startPos.value = target.start || [0, 0]
-    loaded.value = false
-    failed.value = false
-    frameKey.value += 1
-    beginLoad()
+    // 记住的服可能已经被移除，回落到当前实际选中的那台
+    if (activeServer.value.id !== activeServerId.value) {
+      activeServerId.value = activeServer.value.id
+    }
+    applyServer(true)
     scheduleRefresh(data.ttl)
     loadPlayers()
   } catch {
@@ -223,8 +328,21 @@ async function loadConfig() {
   }
 }
 
-async function onMapChange() {
-  await loadConfig()
+function onServerChange() {
+  localStorage.setItem('whs_map_server', activeServerId.value)
+  applyServer(false)
+  loadPlayers()
+}
+
+function onMapChange() {
+  const target = activeServer.value?.maps.find((m) => m.id === activeMap.value)
+  if (!target) return
+  startPos.value = target.start || [0, 0]
+  loaded.value = false
+  failed.value = false
+  frameKey.value += 1
+  beginLoad()
+  loadPlayers()
 }
 
 onMounted(() => {
@@ -232,6 +350,8 @@ onMounted(() => {
   playersTimer = setInterval(loadPlayers, 15000)
   document.addEventListener('fullscreenchange', onFullscreenChange)
   window.addEventListener('keydown', onKeydown)
+  window.addEventListener('resize', syncFrameSize)
+  window.addEventListener('orientationchange', syncFrameSize)
 })
 
 onBeforeUnmount(() => {
@@ -239,8 +359,12 @@ onBeforeUnmount(() => {
   if (playersTimer) clearInterval(playersTimer)
   if (loadTimer) clearTimeout(loadTimer)
   if (controlsTimer) clearTimeout(controlsTimer)
+  if (tuneTimer) clearTimeout(tuneTimer)
+  if (sizeTimer) clearTimeout(sizeTimer)
   document.removeEventListener('fullscreenchange', onFullscreenChange)
   window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('resize', syncFrameSize)
+  window.removeEventListener('orientationchange', syncFrameSize)
   document.body.style.overflow = ''
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {})
 })
@@ -256,6 +380,17 @@ onBeforeUnmount(() => {
         <p class="map-sub">{{ t('map.subtitle') }}</p>
       </div>
       <div class="map-tools">
+        <select
+          v-if="multiServer"
+          v-model="activeServerId"
+          class="map-select"
+          :aria-label="t('map.server')"
+          @change="onServerChange"
+        >
+          <option v-for="s in servers" :key="s.id" :value="s.id" :disabled="!s.ready">
+            {{ s.ready ? s.name : `${s.name}（${t('map.offline')}）` }}
+          </option>
+        </select>
         <div class="view-switch" role="group" :aria-label="t('map.view')">
           <span class="view-thumb" :class="{ 'is-3d': viewMode === '3d' }" aria-hidden="true"></span>
           <button
@@ -318,6 +453,13 @@ onBeforeUnmount(() => {
       </div>
 
       <div v-if="immersive" class="immersive-bar">
+        <button
+          type="button"
+          class="immersive-btn"
+          @click="switchView(viewMode === '3d' ? '2d' : '3d')"
+        >
+          {{ viewMode === '3d' ? t('map.switchTo2d') : t('map.switchTo3d') }}
+        </button>
         <button type="button" class="immersive-btn" @click="exitImmersive">
           {{ t('map.immersiveExit') }}
         </button>
@@ -402,6 +544,9 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 100%;
   border: 0;
+  /* 触摸手势交给地图自己处理，避免浏览器把双指缩放当成页面缩放 */
+  touch-action: none;
+  overscroll-behavior: contain;
 }
 
 .map-loading {
@@ -537,6 +682,8 @@ onBeforeUnmount(() => {
   top: 18px;
   right: 18px;
   z-index: 3;
+  display: flex;
+  gap: 8px;
 }
 
 .immersive-btn {

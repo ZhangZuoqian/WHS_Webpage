@@ -810,6 +810,7 @@ uvicorn main:app --host 127.0.0.1 --port 7777
 - 以**单 worker** 运行（验证码、登录失败计数、服务器状态缓存等均为进程内状态，多 worker 会互相不可见）。
 - 需要长期运行时可交给 systemd / supervisor / Windows 服务等进程管理器；本地一键启动可直接用 `python manage.py --prod`。
 - 首次启动会自动创建数据表、播种维基欢迎页；欢迎页内容随版本升级自动刷新（仅当未被用户编辑过时，以「系统」身份追加修订并保留旧版历史）；`data/` 下缺少的配置文件会以默认值生成，需要手工补全密钥（见 5.2）。
+- 维基的「导入 Word / Excel」功能需要 `python-docx`、`openpyxl`，已写进 `requirements.txt`。从旧版本升级的机器要重新执行一次 `pip install -r requirements.txt`，否则点导入会提示「服务器未安装文档转换组件」。转换只读文件、不保存原文档；保留的是标题、段落、粗斜体、列表、引用、表格和图片，超链接会退化成普通文字，分栏、文本框、艺术字这类复杂排版也不还原。Word 里的图片会落到 `data/wiki_upload/` 并在正文里替换成图片链接，所以这个目录也需要一并备份。
 
 ### 11.2 前端
 
@@ -909,7 +910,7 @@ python SMTP/mail_server.py
   1. 服务端是 Fabric 1.21.11，BlueMap 要放进 `mods/`，不是 `plugins/`。版本按官方下载页标注的 1.21.11 支持线选（5.x，5.14 及以上），别拿面向 26.x 的最新构建。
   2. 首次启动会生成 `config/bluemap/`。`core.conf` 里 `accept-download` 改成 `true`（要联网下载原版材质）；`maps/world.conf` 里打开 `enable-flat-view` 和 `enable-perspective-view`，BlueMap 5.x 没有 `display-type` 这个键，关掉透视就只剩平面视图；`webserver.conf` 里 `enabled` 改成 `true`、`port` 设 8100、`ip` 显式写 `127.0.0.1`，这一项默认是对外监听的。
   3. 第一次启动会全量渲染整张地图，吃 CPU 和磁盘，挑没人玩的时候跑，渲染线程数可以调低。
-  4. nginx 把 `/map3d/` 反代到 `127.0.0.1:8100/`，`proxy_pass` 末尾必须带斜杠，否则路径会多一层 `map3d` 直接 404；同时转发 `Host`、去掉上游的 `X-Frame-Options` 和 CSP 里的 `frame-ancestors`，不然 iframe 会被浏览器拒绝；BlueMap 5.x 的在线玩家是轮询 `players.json`，关掉缓冲可以减少到达延迟。这段放进现有的 `server { listen 31480 ssl; ... }` 里即可。
+  4. nginx 把 `/map3d/` 反代到 `127.0.0.1:8100/`，`proxy_pass` 末尾必须带斜杠，否则路径会多一层 `map3d` 直接 404；同时转发 `Host`、去掉上游的 `X-Frame-Options` 和 `Content-Security-Policy`（BlueMap 默认禁止被 iframe 引用），不然 iframe 会被浏览器拒绝；BlueMap 5.x 的在线玩家是轮询 `players.json`，关掉缓冲可以减少到达延迟。这段放进现有的 `server { listen 31480 ssl; ... }` 里即可。
   5. 代理必须挂鉴权。网站的登录态存在浏览器里，iframe 发请求时不会自己带上，所以后端通过 `/api/map/config` 下发一个 600 秒的 HttpOnly Cookie，nginx 用 `auth_request` 校验。注意 `auth_request` 是**每个子请求**都会触发的，3D 场景一次加载就有几百上千个瓦片和模型请求，不加缓存会把这些全部打到后端，必须按下面的配置给鉴权结果做缓存（通过的结果 60 秒，失败的结果 10 秒）：
 
 ```nginx
@@ -917,6 +918,14 @@ python SMTP/mail_server.py
 # 都会回源到后端一次，一个页面就是几百上千次
 # cache/mapauth 目录要事先建好，路径相对于 nginx 的 prefix 目录
 proxy_cache_path cache/mapauth levels=1:2 keys_zone=mapauth:1m max_size=10m inactive=60s;
+
+# 缓存 key 用凭据 Cookie。取不到值时退回唯一的请求 ID，
+# 避免「所有人共用一条空串 key」而互相命中对方的鉴权结果。
+# 如果改过后端的 map.cookie_name，这里的变量名也要同步改。
+map $cookie_whs_map $mapauth_key {
+    ""      $request_id;
+    default $cookie_whs_map;
+}
 
 # 内部鉴权端点，直接打后端，不经过前端 dev server
 location = /api/map/auth {
@@ -929,7 +938,7 @@ location = /api/map/auth {
     proxy_intercept_errors off;
 
     proxy_cache mapauth;
-    proxy_cache_key "$cookie_whs_map";
+    proxy_cache_key $mapauth_key;
     # 通过的结果缓存 60 秒，一个用户再怎么拖地图，一分钟最多回源一次；
     # 失败的只缓存 10 秒，免得刚登录的人被挡太久
     proxy_cache_valid 204 60s;
@@ -981,8 +990,55 @@ location /api/map/ {
 }
 ```
 
-  6. `data/config.json` 的 `map` 段：`bluemap_base` 填 `http://127.0.0.1:8100`，后端拉 settings 和玩家数用；`bluemap_viewer` 填 `/map3d/`，这是浏览器入口，必须是同源路径；`maps` 填真实地图 id，默认 `world`；`start_y` 是地图出生点的地表高度，2D 直接用它，3D 在此基础上抬 20 格；站点是 HTTPS，`cookie_secure` 直接设 `true`。
-  7. 改完配置重启后端生效。访问权限卡在 permission ≥ 2，代码里已经处理。
+  6. `data/config.json` 的 `map` 段。只有一台服时可以直接用扁平写法：
+
+```json
+"map": {
+  "bluemap_base": "http://127.0.0.1:8100",
+  "bluemap_viewer": "/map3d/",
+  "maps": ["world"],
+  "start_y": 80,
+  "cookie_secure": true
+}
+```
+
+  有多台服（主服 + 创造服，或者不想把 BlueMap 都挤在一台机器上）就改成 `servers` 数组，每一项对应一个入口：
+
+```json
+"map": {
+  "cookie_secure": true,
+  "servers": [
+    {
+      "id": "main",
+      "name": "主服",
+      "bluemap_base": "http://127.0.0.1:8100",
+      "bluemap_viewer": "/map3d/",
+      "maps": ["world"],
+      "start_y": 80
+    },
+    {
+      "id": "creative",
+      "name": "创造服",
+      "bluemap_base": "http://192.168.1.21:8100",
+      "bluemap_viewer": "/map3d/creative/",
+      "maps": ["world"],
+      "start_y": 70
+    }
+  ]
+}
+```
+
+  `bluemap_base` 是后端拉数据和玩家数用的地址，可以指向别的机器；`bluemap_viewer` 是浏览器入口，必须是同源路径，多台服各占一个，不能重复。`start_y` 填出生点的地表高度，2D 直接用它，3D 在此基础上抬 30 格，让机位从上方俯视而不是贴着地面。哪台服没部署，前端就把它标成「未部署」并禁用，不影响其他服。
+  7. 多台服时 nginx 要多加一段反代，和主服那段除了路径和目标地址之外完全一样：
+
+```nginx
+location /map3d/creative/ {
+    auth_request /api/map/auth;
+    proxy_pass http://192.168.1.21:8100/;
+    # 其余头部、Cookie 透传、缓存和 proxy_intercept_errors 与 /map3d/ 相同
+}
+```
+  8. 改完配置重启后端生效。访问权限卡在 permission ≥ 2，代码里已经处理。
 
 
 ---

@@ -9,6 +9,7 @@
 数据层抛出的 :class:`WikiDatabaseError`（如 slug 冲突、乐观锁冲突、子页删除）
 由 main.py 注册的全局异常处理器统一翻译为结构化 + 双语错误响应。
 """
+import io
 import mimetypes
 import re
 import uuid
@@ -494,3 +495,207 @@ def wiki_upload_file(filename: str):
         return _error_response("wiki_upload_not_found", 404)
     media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return FileResponse(path, media_type=media_type)
+
+
+# ---------------------------------------------------------------------------
+# 文档导入：Word(.docx) / Excel(.xlsx) -> Markdown
+#
+# 仅做一次性转换，文件不落盘（文档里的内嵌图片除外，需保存后可引用）。
+# 依赖 python-docx / openpyxl，未安装时返回 wiki_import_unavailable，
+# 不影响本站其他功能。
+# ---------------------------------------------------------------------------
+IMPORT_EXTS = {"docx", "xlsx"}
+MAX_IMPORT_SIZE = 10 * 1024 * 1024
+# 单元格总量上限，避免超大表格把响应撑爆
+MAX_IMPORT_CELLS = 20000
+_IMPORT_IMAGE_EXTS = {"png", "jpg", "jpeg", "webp", "gif"}
+
+
+class _ImportTooLarge(Exception):
+    """表格单元格总量超限，需要单独提示，不能混进「文档损坏」。"""
+
+
+def _md_cell(value: str) -> str:
+    """表格单元格转义：竖线会破坏列结构，换行统一压成空格。"""
+    return str(value or "").replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
+
+
+def _md_table(rows: list[list[str]]) -> str:
+    """二维数组 -> Markdown 表格；首行作表头，全空行丢弃。"""
+    rows = [r for r in rows if any((c or "").strip() for c in r)]
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    rows = [list(r) + [""] * (width - len(r)) for r in rows]
+    lines = ["| " + " | ".join(_md_cell(c) for c in rows[0]) + " |"]
+    lines.append("| " + " | ".join("---" for _ in range(width)) + " |")
+    for r in rows[1:]:
+        lines.append("| " + " | ".join(_md_cell(c) for c in r) + " |")
+    return "\n".join(lines)
+
+
+def _save_import_image(blob: bytes, partname: str) -> str | None:
+    """把文档内嵌图片写入 wiki_upload，返回可直接引用的 URL。"""
+    ext = (str(partname).rsplit(".", 1)[-1] if "." in str(partname) else "png").lower()
+    if ext not in _IMPORT_IMAGE_EXTS:
+        ext = "png"
+    if not blob:
+        return None
+    WIKI_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    name = f"{uuid.uuid4().hex}.{ext}"
+    (WIKI_UPLOAD_DIR / name).write_bytes(blob)
+    return f"/api/wiki/upload/{name}"
+
+
+def _docx_to_markdown(data: bytes) -> tuple[str, int]:
+    """Word 文档 -> Markdown；返回 (正文, 提取的图片数)。"""
+    from docx import Document
+    from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    doc = Document(io.BytesIO(data))
+    blocks: list[str] = []
+    image_count = 0
+
+    def push(block: str) -> None:
+        """相邻的列表项合成紧凑列表，避免每项之间出现空行。"""
+        if block.startswith(("- ", "1. ")) and blocks and blocks[-1].startswith(("- ", "1. ")):
+            blocks[-1] = blocks[-1] + "\n" + block
+        else:
+            blocks.append(block)
+
+    def image_markdown(paragraph) -> str:
+        nonlocal image_count
+        out = []
+        for blip in paragraph._element.findall(".//" + qn("a:blip")):
+            rid = blip.get(qn("r:embed"))
+            part = doc.part.related_parts.get(rid) if rid else None
+            blob = getattr(part, "blob", None)
+            url = _save_import_image(blob, getattr(part, "partname", "")) if blob else None
+            if url:
+                image_count += 1
+                out.append(f"![]({url})")
+        return "\n\n".join(out)
+
+    def run_markdown(run) -> str:
+        chunk = run.text or ""
+        if not chunk:
+            return ""
+        if run.bold and run.italic:
+            return f"***{chunk}***"
+        if run.bold:
+            return f"**{chunk}**"
+        if run.italic:
+            return f"*{chunk}*"
+        return chunk
+
+    for child in doc.element.body.iterchildren():
+        if child.tag == qn("w:tbl"):
+            table = Table(child, doc)
+            rows = [[cell.text for cell in row.cells] for row in table.rows]
+            md = _md_table(rows)
+            if md:
+                blocks.append(md)
+            continue
+        if child.tag != qn("w:p"):
+            continue
+        paragraph = Paragraph(child, doc)
+        style = (paragraph.style.name if paragraph.style is not None else "") or ""
+        body = "".join(run_markdown(run) for run in paragraph.runs).strip()
+        images = image_markdown(paragraph)
+
+        level = None
+        matched = re.search(r"(\d)", style)
+        if matched and ("Heading" in style or "标题" in style):
+            level = min(6, max(1, int(matched.group(1))))
+        if level and body:
+            blocks.append("#" * level + " " + body)
+        elif body:
+            if "List Bullet" in style or "列表段落" in style:
+                push("- " + body)
+            elif "List Number" in style or "列表编号" in style:
+                push("1. " + body)
+            elif "Quote" in style or "引用" in style:
+                blocks.append("> " + body)
+            else:
+                blocks.append(body)
+        if images:
+            blocks.append(images)
+
+    return "\n\n".join(b for b in blocks if b).strip(), image_count
+
+
+def _xlsx_to_markdown(data: bytes) -> tuple[str, int]:
+    """Excel 工作簿 -> Markdown（每个工作表一节）；返回 (正文, 提取的图片数)。"""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    blocks: list[str] = []
+    cells = 0
+    try:
+        for sheet in wb.worksheets:
+            rows: list[list[str]] = []
+            for row in sheet.iter_rows(values_only=True):
+                cells += len(row)
+                if cells > MAX_IMPORT_CELLS:
+                    raise _ImportTooLarge()
+                rows.append(["" if v is None else str(v) for v in row])
+            md = _md_table(rows)
+            if not md:
+                continue
+            title = f"## {sheet.title}" if len(wb.worksheets) > 1 else ""
+            blocks.append((title + "\n\n" + md).strip())
+    finally:
+        wb.close()
+    return "\n\n".join(blocks).strip(), 0
+
+
+@router.post("/api/wiki/import")
+async def wiki_import(
+    file: UploadFile = File(...),
+    user: dict | None = Depends(get_current_user),
+):
+    """把 Word / Excel 文档转换成 Markdown 正文返回，供编辑器直接填入。
+
+    - 仅接受 .docx / .xlsx，大小上限 10MB；
+    - 文档内嵌图片会保存到 ``data/wiki_upload/`` 并替换为图片链接；
+    - 不写入页面，转换结果由前端放进编辑器，作者确认后自行保存。
+    """
+    if user is None:
+        return _error_response("unauthorized", 401)
+    if (user.get("permission") or 0) < 2:
+        return _error_response("permission_denied", 403)
+    original = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    ext = (original.rsplit(".", 1)[-1] if "." in original else "").lower()
+    if ext not in IMPORT_EXTS:
+        return _error_response("wiki_import_unsupported", 400)
+    data = bytearray()
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > MAX_IMPORT_SIZE:
+            return _error_response("wiki_import_too_large", 413)
+    if not data:
+        return _error_response("wiki_import_unsupported", 400)
+    try:
+        if ext == "docx":
+            markdown, images = _docx_to_markdown(bytes(data))
+        else:
+            markdown, images = _xlsx_to_markdown(bytes(data))
+    except _ImportTooLarge:
+        return _error_response("wiki_import_too_many_cells", 413)
+    except ImportError:
+        return _error_response("wiki_import_unavailable", 503)
+    except Exception:
+        return _error_response("wiki_import_failed", 400)
+    if not markdown:
+        return _error_response("wiki_import_empty", 400)
+    return {
+        "success": True,
+        "markdown": markdown,
+        "images": images,
+        "original": original,
+    }

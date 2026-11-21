@@ -12,7 +12,7 @@ import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import {
   ArrowLeft, Save, Undo2, Bold, Italic, Code, SquareCode, Link as LinkIcon,
-  Image, Quote, List, ListOrdered, ListTodo, Table, Minus, Upload,
+  Image, Quote, List, ListOrdered, ListTodo, Table, Minus, Upload, FileUp,
   AlertTriangle, GripVertical, GripHorizontal, ChevronDown, Strikethrough, Palette,
 } from 'lucide-vue-next'
 import { useAuth } from '../../composables/useAuth'
@@ -374,6 +374,27 @@ async function onFileChange(e) {
     await showSaveError(err)
   } finally {
     uploading.value = false
+  }
+}
+
+// Word / Excel 导入：转成 Markdown 后插到光标处，作者确认再保存
+const importInputRef = ref(null)
+const importing = ref(false)
+
+async function onImportChange(e) {
+  const file = e.target.files && e.target.files[0]
+  e.target.value = ''
+  if (!file || importing.value) return
+  importing.value = true
+  try {
+    const data = await wikiApi.importDoc(file)
+    const markdown = String((data && data.markdown) || '').trim()
+    if (!markdown) throw new Error(t('pages.wiki.loadError'))
+    insertMarkdownAtCursor(`\n\n${markdown}\n\n`)
+  } catch (err) {
+    await showSaveError(err)
+  } finally {
+    importing.value = false
   }
 }
 
@@ -820,6 +841,24 @@ const charCount = computed(() => text.value.replace(/\s/g, '').length)
         @click="fileInputRef?.click()"
       >
         <Upload :size="15" />
+      </button>
+
+      <!-- 导入 Word / Excel，自动转成 Markdown 填进正文 -->
+      <input
+        ref="importInputRef"
+        type="file"
+        class="file-input"
+        accept=".docx,.xlsx"
+        @change="onImportChange"
+      />
+      <button
+        type="button"
+        class="tool-btn"
+        :disabled="importing"
+        :title="importing ? t('pages.wiki.editor.importing') : t('pages.wiki.editor.importDoc')"
+        @click="importInputRef?.click()"
+      >
+        <FileUp :size="15" />
       </button>
 
       <span class="tool-spacer"></span>
